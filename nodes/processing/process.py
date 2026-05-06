@@ -30,6 +30,94 @@ def numpy_to_comfy_image(np_image):
     img_rgb = img_rgb.astype(np.float32) / 255.0
     return torch.from_numpy(img_rgb).unsqueeze(0)
 
+
+def _scale_debug_enabled(*flags):
+    for flag in flags:
+        if isinstance(flag, dict):
+            value = flag.get("_debug_scale")
+        else:
+            value = flag
+        if isinstance(value, str):
+            value = value.strip().lower() in {"1", "true", "yes", "on"}
+        if bool(value):
+            return True
+    env = os.getenv("SAM3DBODY_DEBUG_SCALE", "").strip().lower()
+    return env in {"1", "true", "yes", "on"}
+
+
+def _debug_stat_block(value):
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=np.float32)
+    except Exception:
+        return None
+    if arr.size == 0:
+        return {"shape": list(arr.shape), "empty": True}
+    flat = arr.reshape(-1)
+    out = {
+        "shape": list(arr.shape),
+        "min": round(float(np.min(flat)), 6),
+        "max": round(float(np.max(flat)), 6),
+        "mean": round(float(np.mean(flat)), 6),
+        "norm": round(float(np.linalg.norm(flat)), 6),
+    }
+    if flat.size <= 8:
+        out["values"] = [round(float(v), 6) for v in flat.tolist()]
+    return out
+
+
+def _debug_points_block(value):
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=np.float32)
+    except Exception:
+        return None
+    if arr.size == 0:
+        return {"shape": list(arr.shape), "empty": True}
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(-1, arr.shape[-1])
+    if arr.ndim != 2:
+        return _debug_stat_block(arr)
+    mins = np.min(arr, axis=0)
+    maxs = np.max(arr, axis=0)
+    center = np.mean(arr, axis=0)
+    return {
+        "shape": list(arr.shape),
+        "min": [round(float(v), 6) for v in mins.tolist()],
+        "max": [round(float(v), 6) for v in maxs.tolist()],
+        "extent": [round(float(v), 6) for v in (maxs - mins).tolist()],
+        "center": [round(float(v), 6) for v in center.tolist()],
+    }
+
+
+def _debug_bbox_block(value):
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=np.float32).reshape(-1)
+    except Exception:
+        return None
+    if arr.size != 4:
+        return _debug_stat_block(arr)
+    x1, y1, x2, y2 = [float(v) for v in arr.tolist()]
+    return {
+        "xyxy": [round(x1, 3), round(y1, 3), round(x2, 3), round(y2, 3)],
+        "size": [round(x2 - x1, 3), round(y2 - y1, 3)],
+        "center": [round((x1 + x2) * 0.5, 3), round((y1 + y2) * 0.5, 3)],
+    }
+
+
+def _scale_debug_log(stage: str, **payload):
+    safe = {"stage": stage}
+    for key, value in payload.items():
+        if value is not None:
+            safe[key] = value
+    print(f"[SAM3DBody][scale-debug] {json.dumps(safe, ensure_ascii=False, sort_keys=True)}")
+
 # Module-level cache for loaded model (persists across calls in worker)
 _MODEL_CACHE = {}
 
@@ -1110,6 +1198,31 @@ def _to_serializable(value):
     return value
 
 
+def _compact_points_bounds(value):
+    if value is None:
+        return None
+    try:
+        arr = np.asarray(value, dtype=np.float32)
+    except Exception:
+        return None
+    if arr.size == 0:
+        return None
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    elif arr.ndim > 2:
+        arr = arr.reshape(-1, arr.shape[-1])
+    if arr.ndim != 2 or arr.shape[1] < 3:
+        return None
+    mins = arr.min(axis=0)
+    maxs = arr.max(axis=0)
+    return {
+        "min": mins.astype(np.float32).tolist(),
+        "max": maxs.astype(np.float32).tolist(),
+        "center": (((mins + maxs) * 0.5).astype(np.float32)).tolist(),
+        "extent": ((maxs - mins).astype(np.float32)).tolist(),
+    }
+
+
 def _hand_image_to_rgb_uint8(image):
     """Convert a ComfyUI IMAGE tensor (B, H, W, C) into a contiguous
     HxWx3 uint8 RGB array — the format the hand decoder helper expects.
@@ -1185,7 +1298,7 @@ def _override_hand_in_raw_output(raw_output, *, lhand_params=None, rhand_params=
     raw_output["hand_pose_params"] = hp
 
 
-def _extract_pose_json(mesh_data, image):
+def _extract_pose_json(mesh_data, image, debug_scale=False):
     raw_output = mesh_data.get("raw_output", {}) if isinstance(mesh_data, dict) else {}
     img_h = int(image.shape[1]) if hasattr(image, "shape") and len(image.shape) > 1 else 0
     img_w = int(image.shape[2]) if hasattr(image, "shape") and len(image.shape) > 2 else 0
@@ -1202,10 +1315,12 @@ def _extract_pose_json(mesh_data, image):
         "shape_params": _to_serializable(raw_output.get("shape_params")),
         "scale_params": _to_serializable(raw_output.get("scale_params")),
         "expr_params": _to_serializable(raw_output.get("expr_params")),
+        "pred_vertices_bounds": _compact_points_bounds(raw_output.get("pred_vertices")),
         "image_size": {
             "height": img_h,
             "width": img_w,
         },
+        "_debug_scale": bool(debug_scale),
     }
     return json.dumps(pose_json, ensure_ascii=False, indent=2)
 
@@ -1310,6 +1425,10 @@ class SAM3DBodyProcessToJson:
                     "default": "full",
                     "tooltip": "full: body+hand decoders, body: body decoder only, hand: hand decoder only",
                 }),
+                "debug_scale": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "Emit detailed scale/camera diagnostics to the console",
+                }),
             },
             "optional": {
                 "mask": ("MASK", {
@@ -1348,7 +1467,7 @@ class SAM3DBodyProcessToJson:
         return np.array([[cmin, rmin, cmax, rmax]], dtype=np.float32)
 
     def process_to_json(self, model, image, bbox_threshold=0.8,
-                        inference_type="full", mask=None,
+                        inference_type="full", debug_scale=False, mask=None,
                         Left_hand_image=None, Right_hand_image=None):
         from ..sam_3d_body import SAM3DBodyEstimator
 
@@ -1364,13 +1483,30 @@ class SAM3DBodyProcessToJson:
         img_bgr = comfy_image_to_numpy(image)
         mask_np = None
         bboxes = None
+        bbox_source = None
         if mask is not None:
             mask_np = comfy_mask_to_numpy(mask)
             if mask_np.ndim == 3:
                 mask_np = mask_np[0]
             bboxes = self._bbox_from_mask(mask_np)
+            bbox_source = "input_mask"
         else:
             mask_np, bboxes = auto_mask_bgr(img_bgr)
+            bbox_source = "auto_mask"
+
+        debug_scale = _scale_debug_enabled(debug_scale)
+        if debug_scale:
+            mask_coverage = None
+            if mask_np is not None:
+                mask_coverage = round(float(np.mean(mask_np > 0.5)), 6)
+            _scale_debug_log(
+                "process.input",
+                image_size=[int(img_bgr.shape[1]), int(img_bgr.shape[0])],
+                bbox_source=bbox_source,
+                bbox=_debug_bbox_block(bboxes[0] if bboxes is not None and len(bboxes) else None),
+                mask_coverage=mask_coverage,
+                inference_type=str(inference_type),
+            )
 
         with tempfile.NamedTemporaryFile(suffix='.jpg', delete=False) as tmp:
             cv2.imwrite(tmp.name, img_bgr)
@@ -1415,7 +1551,21 @@ class SAM3DBodyProcessToJson:
             )
 
         mesh_data = {"raw_output": outputs[0]}
-        pose_json = _extract_pose_json(mesh_data, image)
+        if debug_scale:
+            raw = outputs[0]
+            _scale_debug_log(
+                "process.output",
+                bbox=_debug_bbox_block(raw.get("bbox")),
+                pred_cam_t=_debug_stat_block(raw.get("pred_cam_t")),
+                focal_length=_debug_stat_block(raw.get("focal_length")),
+                pred_keypoints_3d=_debug_points_block(raw.get("pred_keypoints_3d")),
+                pred_vertices=_debug_points_block(raw.get("pred_vertices")),
+                pred_joint_coords=_debug_points_block(raw.get("pred_joint_coords")),
+                shape_params=_debug_stat_block(raw.get("shape_params")),
+                scale_params=_debug_stat_block(raw.get("scale_params")),
+                expr_params=_debug_stat_block(raw.get("expr_params")),
+            )
+        pose_json = _extract_pose_json(mesh_data, image, debug_scale=debug_scale)
         return (pose_json,)
 
 
@@ -1553,6 +1703,7 @@ class SAM3DBodyRenderFromPoseAndBodyPresetJson:
                 "width":        ("INT",   {"default": 0,   "min": 0,    "max": 8192}),
                 "height":       ("INT",   {"default": 0,   "min": 0,    "max": 8192}),
                 "pose_adjust":  ("FLOAT", {"default": 0.0, "min": 0.0,  "max": 1.0, "step": 0.01}),
+                "debug_scale": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "background_image": ("IMAGE",),
@@ -1568,6 +1719,7 @@ class SAM3DBodyRenderFromPoseAndBodyPresetJson:
                offset_x=0.0, offset_y=0.0, scale_offset=1.0,
                camera_yaw_deg=0.0, camera_pitch_deg=0.0,
                width=1024, height=1024, pose_adjust=0.0,
+               debug_scale=False,
                background_image=None):
         # Parse body_preset_json. Missing / malformed → MHR neutral body
         # (all defaults), so an empty input still produces a sensible
@@ -1632,6 +1784,7 @@ class SAM3DBodyRenderFromPoseAndBodyPresetJson:
             payload = json.loads(pose_json) if pose_json else {}
         except Exception:
             payload = {}
+        debug_scale = _scale_debug_enabled(debug_scale, payload)
         loaded = _load_sam3d_model(model)
         sam_3d_model = loaded["model"]
         device = torch.device(loaded["device"])
@@ -1732,12 +1885,44 @@ class SAM3DBodyRenderFromPoseAndBodyPresetJson:
         vertices = verts.detach().cpu().numpy()
         if vertices.ndim == 3:
             vertices = vertices[0]
+        if debug_scale:
+            _scale_debug_log(
+                "render.payload",
+                pose_camera=_debug_stat_block(payload.get("camera")),
+                pose_focal_length=_debug_stat_block(payload.get("focal_length")),
+                pose_keypoints_3d=_debug_points_block(payload.get("keypoints_3d")),
+                pose_shape_params=_debug_stat_block(payload.get("shape_params")),
+                pose_scale_params=_debug_stat_block(payload.get("scale_params")),
+                preset_bone_lengths={
+                    "torso": round(float(bone_torso), 4),
+                    "neck": round(float(bone_neck), 4),
+                    "arm": round(float(bone_arm), 4),
+                    "leg": round(float(bone_leg), 4),
+                },
+                preset_body_params={
+                    "fat": round(float(body_fat), 4),
+                    "muscle": round(float(body_muscle), 4),
+                    "fat_muscle": round(float(body_fat_muscle), 4),
+                    "limb_girth": round(float(body_limb_girth), 4),
+                    "limb_muscle": round(float(body_limb_muscle), 4),
+                    "limb_fat": round(float(body_limb_fat), 4),
+                    "chest_shoulder": round(float(body_chest_shoulder), 4),
+                    "waist_hip": round(float(body_waist_hip), 4),
+                    "thigh_calf": round(float(body_thigh_calf), 4),
+                },
+            )
         rots_np = joint_rots.detach().cpu().numpy() if joint_rots is not None else None
         if rots_np is not None and rots_np.ndim == 4:
             rots_np = rots_np[0]
         coords_np = joint_coords.detach().cpu().numpy() if joint_coords is not None else None
         if coords_np is not None and coords_np.ndim == 3:
             coords_np = coords_np[0]
+        if debug_scale:
+            _scale_debug_log(
+                "render.mhr_forward.initial",
+                vertices=_debug_points_block(vertices),
+                joint_coords=_debug_points_block(coords_np),
+            )
         faces = sam_3d_model.head_pose.faces.detach().cpu().numpy()
 
         # Normalize each bone's vertex cloud back to its rest size. MHR
@@ -1748,6 +1933,11 @@ class SAM3DBodyRenderFromPoseAndBodyPresetJson:
         if coords_np is not None:
             _get_mhr_rest_verts(mhr_head, device)  # ensure metrics cached
             vertices = _normalize_bone_lengths(vertices, coords_np)
+            if debug_scale:
+                _scale_debug_log(
+                    "render.after_bone_normalize",
+                    vertices=_debug_points_block(vertices),
+                )
 
         # Face / neck blend-shapes (FBX-derived morph targets). Shapes may
         # span multiple FBX objects (e.g. neck_lengthen on head+neck+chest);
@@ -1762,6 +1952,11 @@ class SAM3DBodyRenderFromPoseAndBodyPresetJson:
                 vertices, rest_verts, bs_sliders, rots_np,
                 presets_dir, bs_npz_path,
             )
+            if debug_scale:
+                _scale_debug_log(
+                    "render.after_blendshapes",
+                    vertices=_debug_points_block(vertices),
+                )
 
         # Bone-length scaling. Each slider scales the parent->self rest
         # offset of every joint in its category (torso / neck / arm / leg)
@@ -1782,6 +1977,11 @@ class SAM3DBodyRenderFromPoseAndBodyPresetJson:
                 neck_scale=float(bone_neck),
                 joint_rots_posed=rots_np,
             )
+            if debug_scale:
+                _scale_debug_log(
+                    "render.after_bone_scale",
+                    vertices=_debug_points_block(vertices),
+                )
 
         corrected_pose_json = {}
         if coords_np is not None and lean_strength > 1e-6:
@@ -1790,6 +1990,12 @@ class SAM3DBodyRenderFromPoseAndBodyPresetJson:
                 coords_np,
                 lean_strength,
             )
+            if debug_scale:
+                _scale_debug_log(
+                    "render.after_pose_adjust",
+                    vertices=_debug_points_block(vertices),
+                    lean_strength=round(float(lean_strength), 6),
+                )
             if rots_np is not None:
                 corrected_rots, corrected_coords = apply_pose_lean_correction_rig(
                     rots_np,
@@ -1842,6 +2048,7 @@ class SAM3DBodyRenderFromPoseAndBodyPresetJson:
 
         orig_cam = payload.get("camera")
         kpts_3d = payload.get("keypoints_3d")
+        pred_vertices_bounds = payload.get("pred_vertices_bounds") or {}
 
         # Current MHR mesh bounds (after pose + bone normalization + blend shapes).
         mhr_mins = vertices.min(axis=0)
@@ -1852,34 +2059,54 @@ class SAM3DBodyRenderFromPoseAndBodyPresetJson:
         mhr_h_extent = float(mhr_maxs[1] - mhr_mins[1])
 
         camera = None
-        if orig_cam is not None and kpts_3d is not None:
+        camera_fit = None
+        if orig_cam is not None:
             try:
-                kpts = np.asarray(kpts_3d, dtype=np.float32).reshape(-1, 3)
-                if kpts.shape[0] >= 2:
+                orig_center = pred_vertices_bounds.get("center")
+                orig_extent = pred_vertices_bounds.get("extent")
+                source_name = "pred_vertices_bounds"
+                if orig_center is None or orig_extent is None:
+                    source_name = "keypoints_3d"
+                    if kpts_3d is None:
+                        raise ValueError("missing original bounds source")
+                    kpts = np.asarray(kpts_3d, dtype=np.float32).reshape(-1, 3)
+                    if kpts.shape[0] < 2:
+                        raise ValueError("not enough keypoints for camera fit")
                     kmin = kpts.min(axis=0)
                     kmax = kpts.max(axis=0)
-                    orig_cx = float((kmin[0] + kmax[0]) * 0.5)
-                    orig_cy = float((kmin[1] + kmax[1]) * 0.5)
-                    orig_cz = float((kmin[2] + kmax[2]) * 0.5)
-                    orig_h = float(kmax[1] - kmin[1])
-                    if orig_h > 1e-4 and mhr_h_extent > 1e-4:
-                        ratio = mhr_h_extent / orig_h
-                        c = np.asarray(orig_cam, dtype=np.float32).reshape(3)
-                        # Preserve the original image's composition: match
-                        # each axis's pixel projection of the subject's
-                        # centroid. Derivation (all in camera/flipped frame):
-                        #   orig px = (orig_c + orig_cam) * focal / (orig_cz + orig_cam_z)
-                        #   mhr  px = (mhr_c_flipped + cam) * focal / (mhr_cz_flipped + cam_z)
-                        # Angular-size match fixes the denominator ratio, then:
-                        #   cam = ratio * (orig_c + orig_cam) - mhr_c_flipped
-                        # MHR vertices are in MHR native (unflipped) frame,
-                        # the renderer flips Y/Z before adding cam, so
-                        # mhr_c_flipped = (mhr_cx, -mhr_cy, -mhr_cz) relative
-                        # to the native centroid computed above.
-                        cam_x = ratio * (orig_cx + float(c[0])) - mhr_cx
-                        cam_y = ratio * (orig_cy + float(c[1])) + mhr_cy
-                        cam_z = ratio * (orig_cz + float(c[2])) + mhr_cz
-                        camera = np.array([cam_x, cam_y, cam_z], dtype=np.float32)
+                    orig_center = ((kmin + kmax) * 0.5).tolist()
+                    orig_extent = (kmax - kmin).tolist()
+
+                orig_center = np.asarray(orig_center, dtype=np.float32).reshape(3)
+                orig_extent = np.asarray(orig_extent, dtype=np.float32).reshape(3)
+                orig_cx = float(orig_center[0])
+                orig_cy = float(orig_center[1])
+                orig_cz = float(orig_center[2])
+                orig_h = float(orig_extent[1])
+                if orig_h > 1e-4 and mhr_h_extent > 1e-4:
+                    ratio = mhr_h_extent / orig_h
+                    camera_fit = {
+                        "source": source_name,
+                        "orig_height": round(orig_h, 6),
+                        "mhr_height": round(mhr_h_extent, 6),
+                        "height_ratio": round(ratio, 6),
+                    }
+                    c = np.asarray(orig_cam, dtype=np.float32).reshape(3)
+                    # Preserve the original image's composition: match
+                    # each axis's pixel projection of the subject's
+                    # centroid. Derivation (all in camera/flipped frame):
+                    #   orig px = (orig_c + orig_cam) * focal / (orig_cz + orig_cam_z)
+                    #   mhr  px = (mhr_c_flipped + cam) * focal / (mhr_cz_flipped + cam_z)
+                    # Angular-size match fixes the denominator ratio, then:
+                    #   cam = ratio * (orig_c + orig_cam) - mhr_c_flipped
+                    # MHR vertices are in MHR native (unflipped) frame,
+                    # the renderer flips Y/Z before adding cam, so
+                    # mhr_c_flipped = (mhr_cx, -mhr_cy, -mhr_cz) relative
+                    # to the native centroid computed above.
+                    cam_x = ratio * (orig_cx + float(c[0])) - mhr_cx
+                    cam_y = ratio * (orig_cy + float(c[1])) + mhr_cy
+                    cam_z = ratio * (orig_cz + float(c[2])) + mhr_cz
+                    camera = np.array([cam_x, cam_y, cam_z], dtype=np.float32)
             except Exception:
                 camera = None
 
@@ -1899,6 +2126,25 @@ class SAM3DBodyRenderFromPoseAndBodyPresetJson:
                 [-cx, cy, float(max(cam_z_v, cam_z_h, 0.5))],
                 dtype=np.float32,
             )
+            camera_fit = {
+                "fallback": True,
+                "w_extent": round(w_extent, 6),
+                "h_extent": round(h_extent, 6),
+                "cam_z_v": round(float(cam_z_v), 6),
+                "cam_z_h": round(float(cam_z_h), 6),
+            }
+
+        if debug_scale:
+            _scale_debug_log(
+                "render.camera_fit",
+                focal_length=round(float(focal_length), 6),
+                mhr_vertices=_debug_points_block(vertices),
+                keypoints_3d=_debug_points_block(kpts_3d),
+                pred_vertices_bounds=pred_vertices_bounds or None,
+                orig_cam=_debug_stat_block(orig_cam),
+                camera_fit=camera_fit,
+                resolved_camera=_debug_stat_block(camera),
+            )
 
         # UI overrides apply on top.
         camera[0] += float(offset_x)
@@ -1909,6 +2155,14 @@ class SAM3DBodyRenderFromPoseAndBodyPresetJson:
         s = float(scale_offset)
         if abs(s) > 1e-6:
             camera[2] /= s
+        if debug_scale:
+            _scale_debug_log(
+                "render.camera_final",
+                offset_x=round(float(offset_x), 6),
+                offset_y=round(float(offset_y), 6),
+                scale_offset=round(float(scale_offset), 6),
+                camera=_debug_stat_block(camera),
+            )
 
         # Orbit camera around the MHR mesh center. Rather than moving the
         # camera (which would also require updating the look direction),
